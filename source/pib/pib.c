@@ -3,7 +3,9 @@
 #include <stdbool.h>
 
 #include "SAPI.h"
+#include "main/php_main.h"
 #include "main/php_output.h"
+#include "ext/standard/basic_functions.h"
 
 #include "sapi/phpdbg/phpdbg.h"
 #include "sapi/embed/php_embed.h"
@@ -189,6 +191,12 @@ char *EMSCRIPTEN_KEEPALIVE pib_exec(char *code)
  * 0 = good, >0 = bad.
  * Code MUST start with a PHP tag.
  * Async.
+ *
+ * Also runs request-shutdown work after the script: shutdown
+ * functions, then output buffers (what captures status/headers/body
+ * for JS). Covers normal return, thrown exceptions, and exit()/die()
+ * bailouts. Stock behavior defers this to the next pib_refresh, too
+ * late for the JS side to observe the current response.
 */
 int EMSCRIPTEN_KEEPALIVE pib_run(char *code)
 {
@@ -223,6 +231,33 @@ int EMSCRIPTEN_KEEPALIVE pib_run(char *code)
 		retVal = 1; // Code died.
 	}
 	zend_end_try();
+
+	// die()/exit() leaves a graceful-exit exception dangling in
+	// EG(exception); userland callbacks (shutdown functions, ob handlers)
+	// short-circuit at their first opcode while it is pending. Real
+	// exceptions were already reported by zend_exception_error above.
+	if (EG(exception)) {
+		zend_clear_exception();
+	}
+
+	// php_request_shutdown ordering: shutdown functions, then output
+	// buffers. Each in its own zend_try; either can re-bailout and the
+	// rest must still run.
+	zend_try
+	{
+		if (PG(modules_activated)) {
+			php_call_shutdown_functions();
+		}
+	}
+	zend_end_try();
+	if (EG(exception)) zend_clear_exception();
+
+	zend_try
+	{
+		php_output_end_all();
+	}
+	zend_end_try();
+	if (EG(exception)) zend_clear_exception();
 
 	pib_flush();
 
